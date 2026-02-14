@@ -42,6 +42,16 @@ import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { formatErrorMessage } from "./errors.js";
 import { isWithinActiveHours } from "./heartbeat-active-hours.js";
 import {
+  advanceForNextHeartbeat,
+  createModelFallbackState,
+  getCurrentModel,
+  getFallbackStateSummary,
+  parseHeartbeatModelConfig,
+  recordFailure,
+  recordSuccess,
+  type HeartbeatModelState,
+} from "./heartbeat-model-fallback.js";
+import {
   buildCronEventPrompt,
   isCronSystemEvent,
   isExecCompletionEvent,
@@ -108,6 +118,8 @@ type HeartbeatAgentState = {
   intervalMs: number;
   lastRunMs?: number;
   nextDueMs: number;
+  /** Model fallback state for tracking primary + fallback chain */
+  modelFallbackState?: HeartbeatModelState;
 };
 
 export type HeartbeatRunner = {
@@ -175,7 +187,13 @@ export function resolveHeartbeatSummaryForAgent(
   );
   const target =
     merged?.target ?? defaults?.target ?? overrides?.target ?? DEFAULT_HEARTBEAT_TARGET;
-  const model = merged?.model ?? defaults?.model ?? overrides?.model;
+  const model =
+    merged?.primary ??
+    merged?.model ??
+    defaults?.primary ??
+    defaults?.model ??
+    overrides?.primary ??
+    overrides?.model;
   const ackMaxChars = Math.max(
     0,
     merged?.ackMaxChars ??
@@ -400,6 +418,7 @@ export async function runHeartbeatOnce(opts: {
   heartbeat?: HeartbeatConfig;
   reason?: string;
   deps?: HeartbeatDeps;
+  modelFallbackState?: HeartbeatModelState;
 }): Promise<HeartbeatRunResult> {
   const cfg = opts.cfg ?? loadConfig();
   const agentId = normalizeAgentId(opts.agentId ?? resolveDefaultAgentId(cfg));
@@ -545,12 +564,35 @@ export async function runHeartbeatOnce(opts: {
     return true;
   };
 
-  try {
-    const heartbeatModelOverride = heartbeat?.model?.trim() || undefined;
-    const replyOpts = heartbeatModelOverride
-      ? { isHeartbeat: true, heartbeatModelOverride }
-      : { isHeartbeat: true };
-    const replyResult = await getReplyFromConfig(ctx, replyOpts, cfg);
+  // Initialize or use provided model fallback state
+  const modelConfig = parseHeartbeatModelConfig(heartbeat);
+  let fallbackState = opts.modelFallbackState ?? createModelFallbackState(modelConfig);
+  
+  // If no model config, fall back to legacy behavior
+  const hasModelConfig = modelConfig !== undefined;
+  
+  // Helper function to run heartbeat with a specific model
+  async function runWithModel(modelOverride: string | undefined): Promise<{
+    result: Awaited<ReturnType<typeof getReplyFromConfig>>;
+    error?: string;
+  }> {
+    try {
+      const replyOpts = modelOverride
+        ? { isHeartbeat: true, heartbeatModelOverride: modelOverride }
+        : { isHeartbeat: true };
+      const result = await getReplyFromConfig(ctx, replyOpts, cfg);
+      return { result };
+    } catch (err) {
+      const errorMsg = formatErrorMessage(err);
+      log.warn(`Heartbeat model call failed: ${errorMsg}`, { model: modelOverride });
+      return { result: undefined, error: errorMsg };
+    }
+  }
+
+  // Helper to process reply result
+  async function processReplyResult(
+    replyResult: Awaited<ReturnType<typeof getReplyFromConfig>>,
+  ): Promise<HeartbeatRunResult | null> {
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);
     const includeReasoning = heartbeat?.includeReasoning === true;
     const reasoningPayloads = includeReasoning
@@ -576,15 +618,11 @@ export async function runHeartbeatOnce(opts: {
         silent: !okSent,
         indicatorType: visibility.useIndicator ? resolveIndicatorType("ok-empty") : undefined,
       });
-      return { status: "ran", durationMs: Date.now() - startedAt };
+      return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
     }
 
     const ackMaxChars = resolveHeartbeatAckMaxChars(cfg, heartbeat);
     const normalized = normalizeHeartbeatReply(replyPayload, responsePrefix, ackMaxChars);
-    // For exec completion events, don't skip even if the response looks like HEARTBEAT_OK.
-    // The model should be responding with exec results, not ack tokens.
-    // Also, if normalized.text is empty due to token stripping but we have exec completion,
-    // fall back to the original reply text.
     const execFallbackText =
       hasExecCompletion && !normalized.text.trim() && replyPayload.text?.trim()
         ? replyPayload.text.trim()
@@ -610,14 +648,13 @@ export async function runHeartbeatOnce(opts: {
         silent: !okSent,
         indicatorType: visibility.useIndicator ? resolveIndicatorType("ok-token") : undefined,
       });
-      return { status: "ran", durationMs: Date.now() - startedAt };
+      return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
     }
 
     const mediaUrls =
       replyPayload.mediaUrls ?? (replyPayload.mediaUrl ? [replyPayload.mediaUrl] : []);
 
-    // Suppress duplicate heartbeats (same payload) within a short window.
-    // This prevents "nagging" when nothing changed but the model repeats the same items.
+    // Suppress duplicate heartbeats
     const prevHeartbeatText =
       typeof entry?.lastHeartbeatText === "string" ? entry.lastHeartbeatText : "";
     const prevHeartbeatAt =
@@ -645,10 +682,10 @@ export async function runHeartbeatOnce(opts: {
         channel: delivery.channel !== "none" ? delivery.channel : undefined,
         accountId: delivery.accountId,
       });
-      return { status: "ran", durationMs: Date.now() - startedAt };
+      return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
     }
 
-    // Reasoning payloads are text-only; any attachments stay on the main reply.
+    // Reasoning payloads are text-only
     const previewText = shouldSkipMain
       ? reasoningPayloads
           .map((payload) => payload.text)
@@ -665,7 +702,7 @@ export async function runHeartbeatOnce(opts: {
         hasMedia: mediaUrls.length > 0,
         accountId: delivery.accountId,
       });
-      return { status: "ran", durationMs: Date.now() - startedAt };
+      return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
     }
 
     if (!visibility.showAlerts) {
@@ -679,96 +716,144 @@ export async function runHeartbeatOnce(opts: {
         reason: "alerts-disabled",
         preview: previewText?.slice(0, 200),
         durationMs: Date.now() - startedAt,
-        channel: delivery.channel,
         hasMedia: mediaUrls.length > 0,
+        channel: delivery.channel !== "none" ? delivery.channel : undefined,
         accountId: delivery.accountId,
-        indicatorType: visibility.useIndicator ? resolveIndicatorType("sent") : undefined,
       });
-      return { status: "ran", durationMs: Date.now() - startedAt };
+      return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
     }
 
-    const deliveryAccountId = delivery.accountId;
-    const heartbeatPlugin = getChannelPlugin(delivery.channel);
-    if (heartbeatPlugin?.heartbeat?.checkReady) {
-      const readiness = await heartbeatPlugin.heartbeat.checkReady({
-        cfg,
-        accountId: deliveryAccountId,
-        deps: opts.deps,
+    // Deliver the heartbeat
+    const payloads: ReplyPayload[] = [];
+    if (!shouldSkipMain) {
+      payloads.push({
+        text: normalized.text,
+        mediaUrl: replyPayload.mediaUrl,
+        mediaUrls: replyPayload.mediaUrls,
       });
-      if (!readiness.ok) {
-        emitHeartbeatEvent({
-          status: "skipped",
-          reason: readiness.reason,
-          preview: previewText?.slice(0, 200),
-          durationMs: Date.now() - startedAt,
-          hasMedia: mediaUrls.length > 0,
-          channel: delivery.channel,
-          accountId: delivery.accountId,
-        });
-        log.info("heartbeat: channel not ready", {
-          channel: delivery.channel,
-          reason: readiness.reason,
-        });
-        return { status: "skipped", reason: readiness.reason };
+    }
+    if (includeReasoning) {
+      for (const reasoning of reasoningPayloads) {
+        if (reasoning.text?.trim()) {
+          payloads.push(reasoning);
+        }
       }
     }
 
-    await deliverOutboundPayloads({
-      cfg,
-      channel: delivery.channel,
-      to: delivery.to,
-      accountId: deliveryAccountId,
-      payloads: [
-        ...reasoningPayloads,
-        ...(shouldSkipMain
-          ? []
-          : [
-              {
-                text: normalized.text,
-                mediaUrls,
-              },
-            ]),
-      ],
-      deps: opts.deps,
-    });
+    if (payloads.length > 0) {
+      await deliverOutboundPayloads({
+        cfg,
+        channel: delivery.channel,
+        to: delivery.to,
+        accountId: delivery.accountId,
+        payloads,
+        deps: opts.deps,
+      });
 
-    // Record last delivered heartbeat payload for dedupe.
-    if (!shouldSkipMain && normalized.text.trim()) {
-      const store = loadSessionStore(storePath);
-      const current = store[sessionKey];
-      if (current) {
-        store[sessionKey] = {
-          ...current,
-          lastHeartbeatText: normalized.text,
-          lastHeartbeatSentAt: startedAt,
-        };
-        await saveSessionStore(storePath, store);
+      // Update session with last heartbeat info
+      const mainPayload = payloads[0];
+      if (mainPayload?.text && entry) {
+        entry.lastHeartbeatText = mainPayload.text;
+        entry.lastHeartbeatSentAt = Date.now();
+        await updateSessionStore(storePath, (store) => {
+          store[sessionKey] = entry;
+        });
       }
     }
 
     emitHeartbeatEvent({
-      status: "sent",
-      to: delivery.to,
+      status: "ok-alert",
+      reason: opts.reason,
       preview: previewText?.slice(0, 200),
       durationMs: Date.now() - startedAt,
       hasMedia: mediaUrls.length > 0,
-      channel: delivery.channel,
-      accountId: delivery.accountId,
-      indicatorType: visibility.useIndicator ? resolveIndicatorType("sent") : undefined,
-    });
-    return { status: "ran", durationMs: Date.now() - startedAt };
-  } catch (err) {
-    const reason = formatErrorMessage(err);
-    emitHeartbeatEvent({
-      status: "failed",
-      reason,
-      durationMs: Date.now() - startedAt,
       channel: delivery.channel !== "none" ? delivery.channel : undefined,
       accountId: delivery.accountId,
-      indicatorType: visibility.useIndicator ? resolveIndicatorType("failed") : undefined,
+      indicatorType: visibility.useIndicator ? resolveIndicatorType("ok-alert") : undefined,
     });
-    log.error(`heartbeat failed: ${reason}`, { error: reason });
-    return { status: "failed", reason };
+
+    return { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
+  }
+
+  // Main execution logic with fallback support
+  try {
+    // If using fallback state, try models in order
+    if (fallbackState) {
+      while (true) {
+        const currentModel = getCurrentModel(fallbackState);
+        if (!currentModel) {
+          // Exhausted all models
+          log.error("Heartbeat failed: all models exhausted", {
+            agentId,
+            attempts: fallbackState.attempts.length,
+          });
+          return {
+            status: "failed",
+            reason: "all-models-failed",
+            modelFallbackState: fallbackState,
+          };
+        }
+
+        log.info(`Attempting heartbeat with model: ${currentModel}`, {
+          agentId,
+          modelIndex: fallbackState.currentIndex,
+        });
+
+        const { result, error } = await runWithModel(currentModel);
+
+        if (error) {
+          // Model call failed
+          const failureResult = recordFailure(fallbackState, currentModel, error);
+          
+          if (!failureResult.shouldRetry) {
+            // No immediate retry - either exhausted or next_heartbeat mode
+            if (fallbackState.fallbackMode === "next_heartbeat") {
+              // Return failure but keep state for next heartbeat
+              return {
+                status: "failed",
+                reason: `model-failed: ${error}`,
+                modelFallbackState: fallbackState,
+              };
+            }
+            // Exhausted all models in immediate mode
+            return {
+              status: "failed",
+              reason: "all-models-failed",
+              modelFallbackState: fallbackState,
+            };
+          }
+          // Continue to next model in immediate mode
+          continue;
+        }
+
+        // Success - record it and process result
+        recordSuccess(fallbackState, currentModel);
+        const processResult = await processReplyResult(result);
+        return processResult ?? { status: "ran", durationMs: Date.now() - startedAt, modelFallbackState: fallbackState };
+      }
+    } else {
+      // Legacy behavior - single model or no model override
+      const legacyModel = heartbeat?.model?.trim();
+      const { result, error } = await runWithModel(legacyModel || undefined);
+      
+      if (error) {
+        return {
+          status: "failed",
+          reason: `model-failed: ${error}`,
+        };
+      }
+      
+      const processResult = await processReplyResult(result);
+      return processResult ?? { status: "ran", durationMs: Date.now() - startedAt };
+    }
+  } catch (err) {
+    const errMsg = formatErrorMessage(err);
+    log.error(`Heartbeat execution failed: ${errMsg}`, { agentId });
+    return {
+      status: "failed",
+      reason: `execution-failed: ${errMsg}`,
+      modelFallbackState: fallbackState,
+    };
   }
 }
 
@@ -850,12 +935,18 @@ export function startHeartbeatRunner(opts: {
       intervals.push(intervalMs);
       const prevState = prevAgents.get(agent.agentId);
       const nextDueMs = resolveNextDue(now, intervalMs, prevState);
+      
+      // Initialize or preserve model fallback state
+      const modelConfig = parseHeartbeatModelConfig(agent.heartbeat);
+      const modelFallbackState = prevState?.modelFallbackState ?? createModelFallbackState(modelConfig);
+      
       nextAgents.set(agent.agentId, {
         agentId: agent.agentId,
         heartbeat: agent.heartbeat,
         intervalMs,
         lastRunMs: prevState?.lastRunMs,
         nextDueMs,
+        modelFallbackState,
       });
     }
 
@@ -913,13 +1004,24 @@ export function startHeartbeatRunner(opts: {
 
       let res: HeartbeatRunResult;
       try {
+        // For next_heartbeat mode, advance to next model if previous failed
+        if (agent.modelFallbackState && agent.heartbeat?.fallbackMode === "next_heartbeat") {
+          advanceForNextHeartbeat(agent.modelFallbackState);
+        }
+        
         res = await runOnce({
           cfg: state.cfg,
           agentId: agent.agentId,
           heartbeat: agent.heartbeat,
           reason,
           deps: { runtime: state.runtime },
+          modelFallbackState: agent.modelFallbackState,
         });
+        
+        // Update the model fallback state after the run
+        if (res.modelFallbackState) {
+          agent.modelFallbackState = res.modelFallbackState;
+        }
       } catch (err) {
         // If runOnce throws (e.g. during session compaction), we must still
         // advance the timer and call scheduleNext so heartbeats keep firing.

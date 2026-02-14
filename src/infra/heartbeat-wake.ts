@@ -1,7 +1,9 @@
+import type { HeartbeatModelState } from "./heartbeat-model-fallback.js";
+
 export type HeartbeatRunResult =
-  | { status: "ran"; durationMs: number }
-  | { status: "skipped"; reason: string }
-  | { status: "failed"; reason: string };
+  | { status: "ran"; durationMs: number; modelFallbackState?: HeartbeatModelState }
+  | { status: "skipped"; reason: string; modelFallbackState?: HeartbeatModelState }
+  | { status: "failed"; reason: string; modelFallbackState?: HeartbeatModelState };
 
 export type HeartbeatWakeHandler = (opts: { reason?: string }) => Promise<HeartbeatRunResult>;
 

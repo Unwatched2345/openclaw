@@ -20,7 +20,11 @@ export const HeartbeatSchema = z
       })
       .strict()
       .optional(),
+    /** @deprecated Use `primary` instead */
     model: z.string().optional(),
+    primary: z.string().optional(),
+    fallbacks: z.array(z.string()).optional(),
+    fallbackMode: z.union([z.literal("immediate"), z.literal("next_heartbeat")]).optional(),
     session: z.string().optional(),
     includeReasoning: z.boolean().optional(),
     target: z.string().optional(),

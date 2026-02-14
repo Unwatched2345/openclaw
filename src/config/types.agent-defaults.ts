@@ -176,8 +176,22 @@ export type AgentDefaultsConfig = {
       /** Timezone for the window ("user", "local", or IANA TZ id). Default: "user". */
       timezone?: string;
     };
-    /** Heartbeat model override (provider/model). */
+    /**
+     * Heartbeat model override (provider/model).
+     * @deprecated Use `primary` instead for single model, or use the full model list config.
+     */
     model?: string;
+    /** Primary model for heartbeat (provider/model). Used with `fallbacks` for model fallback chain. */
+    primary?: string;
+    /** Fallback models to try if primary fails (in order). */
+    fallbacks?: string[];
+    /**
+     * Fallback mode:
+     * - "immediate": Retry with next model right away on failure
+     * - "next_heartbeat": Wait until next heartbeat poll to try next model
+     * @default "immediate"
+     */
+    fallbackMode?: "immediate" | "next_heartbeat";
     /** Session key for heartbeat runs ("main" or explicit session key). */
     session?: string;
     /** Delivery target ("last", "none", or a channel id). */
