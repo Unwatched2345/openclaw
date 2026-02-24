@@ -404,12 +404,21 @@ export async function startServerWithClient(
   return { server, ws, port, prevToken: prev, envSnapshot };
 }
 
+export async function startConnectedServerWithClient(
+  token?: string,
+  opts?: GatewayServerOptions & { wsHeaders?: Record<string, string> },
+) {
+  const started = await startServerWithClient(token, opts);
+  await connectOk(started.ws);
+  return started;
+}
+
 type ConnectResponse = {
   type: "res";
   id: string;
   ok: boolean;
   payload?: Record<string, unknown>;
-  error?: { message?: string };
+  error?: { message?: string; code?: string; details?: unknown };
 };
 
 export async function readConnectChallengeNonce(
@@ -442,6 +451,7 @@ export async function connectReq(
   ws: WebSocket,
   opts?: {
     token?: string;
+    deviceToken?: string;
     password?: string;
     skipDefaultAuth?: boolean;
     minProtocol?: number;
@@ -469,6 +479,7 @@ export async function connectReq(
       nonce?: string;
     } | null;
     skipConnectChallengeNonce?: boolean;
+    timeoutMs?: number;
   },
 ): Promise<ConnectResponse> {
   const { randomUUID } = await import("node:crypto");
@@ -493,7 +504,9 @@ export async function connectReq(
         ? ((testState.gatewayAuth as { password?: string }).password ?? undefined)
         : process.env.OPENCLAW_GATEWAY_PASSWORD;
   const token = opts?.token ?? defaultToken;
+  const deviceToken = opts?.deviceToken?.trim() || undefined;
   const password = opts?.password ?? defaultPassword;
+  const authTokenForSignature = token ?? deviceToken;
   const requestedScopes = Array.isArray(opts?.scopes)
     ? opts.scopes
     : role === "operator"
@@ -523,7 +536,7 @@ export async function connectReq(
       role,
       scopes: requestedScopes,
       signedAtMs,
-      token: token ?? null,
+      token: authTokenForSignature ?? null,
       nonce: connectChallengeNonce,
     });
     return {
@@ -549,9 +562,10 @@ export async function connectReq(
         role,
         scopes: requestedScopes,
         auth:
-          token || password
+          token || password || deviceToken
             ? {
                 token,
+                deviceToken,
                 password,
               }
             : undefined,
@@ -566,7 +580,7 @@ export async function connectReq(
     const rec = o as Record<string, unknown>;
     return rec.type === "res" && rec.id === id;
   };
-  return await onceMessage<ConnectResponse>(ws, isResponseForId);
+  return await onceMessage<ConnectResponse>(ws, isResponseForId, opts?.timeoutMs);
 }
 
 export async function connectOk(ws: WebSocket, opts?: Parameters<typeof connectReq>[1]) {
@@ -585,6 +599,7 @@ export async function connectWebchatClient(params: {
   const ws = new WebSocket(`ws://127.0.0.1:${params.port}`, {
     headers: { origin },
   });
+  trackConnectChallengeNonce(ws);
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timeout waiting for ws open")), 10_000);
     const onOpen = () => {

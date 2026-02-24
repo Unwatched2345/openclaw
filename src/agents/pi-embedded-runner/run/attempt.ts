@@ -19,11 +19,7 @@ import type {
   PluginHookBeforeAgentStartResult,
   PluginHookBeforePromptBuildResult,
 } from "../../../plugins/types.js";
-import {
-  isCronSessionKey,
-  isSubagentSessionKey,
-  normalizeAgentId,
-} from "../../../routing/session-key.js";
+import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import { resolveSignalReactionLevel } from "../../../signal/reaction-level.js";
 import { resolveTelegramInlineButtonsScope } from "../../../telegram/inline-buttons.js";
 import { resolveTelegramReactionLevel } from "../../../telegram/reaction-level.js";
@@ -77,6 +73,7 @@ import {
 } from "../../skills.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
+import { sanitizeToolCallIdsForCloudCodeAssist } from "../../tool-call-id.js";
 import { resolveTranscriptPolicy } from "../../transcript-policy.js";
 import { DEFAULT_BOOTSTRAP_FILENAME } from "../../workspace.js";
 import { isRunnerAbortError } from "../abort.js";
@@ -85,7 +82,6 @@ import { buildEmbeddedExtensionFactories } from "../extensions.js";
 import { applyExtraParamsToAgent } from "../extra-params.js";
 import {
   logToolSchemasForGoogle,
-  sanitizeAntigravityThinkingBlocks,
   sanitizeSessionHistory,
   sanitizeToolsForGoogle,
 } from "../google.js";
@@ -225,6 +221,13 @@ export async function resolvePromptBuildHookResult(params: {
   };
 }
 
+export function resolvePromptModeForSession(sessionKey?: string): "minimal" | "full" {
+  if (!sessionKey) {
+    return "full";
+  }
+  return isSubagentSessionKey(sessionKey) ? "minimal" : "full";
+}
+
 function summarizeMessagePayload(msg: AgentMessage): { textChars: number; imageBlocks: number } {
   const content = (msg as { content?: unknown }).content;
   if (typeof content === "string") {
@@ -355,11 +358,17 @@ export async function runEmbeddedAttempt(
 
     const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
 
+    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
+      sessionKey: params.sessionKey,
+      config: params.config,
+      agentId: params.agentId,
+    });
     // Check if the model supports native image input
     const modelHasVision = params.model.input?.includes("image") ?? false;
     const toolsRaw = params.disableTools
       ? []
       : createOpenClawCodingTools({
+          agentId: sessionAgentId,
           exec: {
             ...params.execOverrides,
             elevated: params.bashElevated,
@@ -389,6 +398,7 @@ export async function runEmbeddedAttempt(
           modelAuthMode: resolveModelAuthMode(params.model.provider, params.config),
           currentChannelId: params.currentChannelId,
           currentThreadTs: params.currentThreadTs,
+          currentMessageId: params.currentMessageId,
           replyToMode: params.replyToMode,
           hasRepliedRef: params.hasRepliedRef,
           modelHasVision,
@@ -450,10 +460,6 @@ export async function runEmbeddedAttempt(
             return undefined;
           })()
         : undefined;
-    const { defaultAgentId, sessionAgentId } = resolveSessionAgentIds({
-      sessionKey: params.sessionKey,
-      config: params.config,
-    });
     const sandboxInfo = buildEmbeddedSandboxInfo(sandbox, params.bashElevated);
     const reasoningTagHint = isReasoningTagProvider(params.provider);
     // Resolve channel-specific message actions for system prompt
@@ -495,10 +501,7 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
-    const promptMode =
-      isSubagentSessionKey(params.sessionKey) || isCronSessionKey(params.sessionKey)
-        ? "minimal"
-        : "full";
+    const promptMode = resolvePromptModeForSession(params.sessionKey);
     const docsPath = await resolveOpenClawDocsPath({
       workspaceDir: effectiveWorkspace,
       argv1: process.argv[1],
@@ -561,7 +564,7 @@ export async function runEmbeddedAttempt(
       tools,
     });
     const systemPromptOverride = createSystemPromptOverride(appendPrompt);
-    const systemPromptText = systemPromptOverride();
+    let systemPromptText = systemPromptOverride();
 
     const sessionLock = await acquireSessionWriteLock({
       sessionFile: params.sessionFile,
@@ -736,6 +739,8 @@ export async function runEmbeddedAttempt(
         params.provider,
         params.modelId,
         params.streamParams,
+        params.thinkLevel,
+        sessionAgentId,
       );
 
       if (cacheTrace) {
@@ -759,6 +764,32 @@ export async function runEmbeddedAttempt(
             return inner(model, context, options);
           }
           const sanitized = dropThinkingBlocks(messages as unknown as AgentMessage[]) as unknown;
+          if (sanitized === messages) {
+            return inner(model, context, options);
+          }
+          const nextContext = {
+            ...(context as unknown as Record<string, unknown>),
+            messages: sanitized,
+          } as unknown;
+          return inner(model, nextContext as typeof context, options);
+        };
+      }
+
+      // Mistral (and other strict providers) reject tool call IDs that don't match their
+      // format requirements (e.g. [a-zA-Z0-9]{9}). sanitizeSessionHistory only processes
+      // historical messages at attempt start, but the agent loop's internal tool call →
+      // tool result cycles bypass that path. Wrap streamFn so every outbound request
+      // sees sanitized tool call IDs.
+      if (transcriptPolicy.sanitizeToolCallIds && transcriptPolicy.toolCallIdMode) {
+        const inner = activeSession.agent.streamFn;
+        const mode = transcriptPolicy.toolCallIdMode;
+        activeSession.agent.streamFn = (model, context, options) => {
+          const ctx = context as unknown as { messages?: unknown };
+          const messages = ctx?.messages;
+          if (!Array.isArray(messages)) {
+            return inner(model, context, options);
+          }
+          const sanitized = sanitizeToolCallIdsForCloudCodeAssist(messages as AgentMessage[], mode);
           if (sanitized === messages) {
             return inner(model, context, options);
           }
@@ -981,13 +1012,7 @@ export async function runEmbeddedAttempt(
       }
 
       // Hook runner was already obtained earlier before tool creation
-      const hookAgentId =
-        typeof params.agentId === "string" && params.agentId.trim()
-          ? normalizeAgentId(params.agentId)
-          : resolveSessionAgentIds({
-              sessionKey: params.sessionKey,
-              config: params.config,
-            }).sessionAgentId;
+      const hookAgentId = sessionAgentId;
 
       let promptError: unknown = null;
       let promptErrorSource: "prompt" | "compaction" | null = null;
@@ -1018,6 +1043,13 @@ export async function runEmbeddedAttempt(
               `hooks: prepended context to prompt (${hookResult.prependContext.length} chars)`,
             );
           }
+          const legacySystemPrompt =
+            typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
+          if (legacySystemPrompt) {
+            applySystemPromptOverrideToSession(activeSession, legacySystemPrompt);
+            systemPromptText = legacySystemPrompt;
+            log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
+          }
         }
 
         log.debug(`embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId}`);
@@ -1035,10 +1067,7 @@ export async function runEmbeddedAttempt(
             sessionManager.resetLeaf();
           }
           const sessionContext = sessionManager.buildSessionContext();
-          const sanitizedOrphan = transcriptPolicy.sanitizeThinkingSignatures
-            ? sanitizeAntigravityThinkingBlocks(sessionContext.messages)
-            : sessionContext.messages;
-          activeSession.agent.replaceMessages(sanitizedOrphan);
+          activeSession.agent.replaceMessages(sessionContext.messages);
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,

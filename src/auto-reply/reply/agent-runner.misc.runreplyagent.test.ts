@@ -876,6 +876,19 @@ describe("runReplyAgent messaging tool suppression", () => {
     expect(result).toMatchObject({ text: "hello world!" });
   });
 
+  it("keeps final reply when text matches a cross-target messaging send", async () => {
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "hello world!" }],
+      messagingToolSentTexts: ["hello world!"],
+      messagingToolSentTargets: [{ tool: "discord", provider: "discord", to: "channel:C1" }],
+      meta: {},
+    });
+
+    const result = await createRun("slack");
+
+    expect(result).toMatchObject({ text: "hello world!" });
+  });
+
   it("delivers replies when account ids do not match", async () => {
     runEmbeddedPiAgentMock.mockResolvedValueOnce({
       payloads: [{ text: "hello world!" }],
@@ -1166,8 +1179,8 @@ describe("runReplyAgent fallback reasoning tags", () => {
     });
     runWithModelFallbackMock.mockImplementationOnce(
       async ({ run }: RunWithModelFallbackParams) => ({
-        result: await run("google-antigravity", "gemini-3"),
-        provider: "google-antigravity",
+        result: await run("google-gemini-cli", "gemini-3"),
+        provider: "google-gemini-cli",
         model: "gemini-3",
       }),
     );
@@ -1186,8 +1199,8 @@ describe("runReplyAgent fallback reasoning tags", () => {
       return { payloads: [{ text: "ok" }], meta: {} };
     });
     runWithModelFallbackMock.mockImplementation(async ({ run }: RunWithModelFallbackParams) => ({
-      result: await run("google-antigravity", "gemini-3"),
-      provider: "google-antigravity",
+      result: await run("google-gemini-cli", "gemini-3"),
+      provider: "google-gemini-cli",
       model: "gemini-3",
     }));
 

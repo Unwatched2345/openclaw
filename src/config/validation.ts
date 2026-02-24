@@ -3,7 +3,7 @@ import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent
 import { CHANNEL_IDS, normalizeChatChannelId } from "../channels/registry.js";
 import {
   normalizePluginsConfig,
-  resolveEnableState,
+  resolveEffectiveEnableState,
   resolveMemorySlotDecision,
 } from "../plugins/config-state.js";
 import { loadPluginManifestRegistry } from "../plugins/manifest-registry.js";
@@ -232,7 +232,7 @@ function validateConfigObjectWithPluginsBase(
     return registryInfo;
   };
 
-  const allowedChannels = new Set<string>(["defaults", ...CHANNEL_IDS]);
+  const allowedChannels = new Set<string>(["defaults", "modelByChannel", ...CHANNEL_IDS]);
 
   if (config.channels && isRecord(config.channels)) {
     for (const key of Object.keys(config.channels)) {
@@ -373,7 +373,12 @@ function validateConfigObjectWithPluginsBase(
     const entry = normalizedPlugins.entries[pluginId];
     const entryHasConfig = Boolean(entry?.config);
 
-    const enableState = resolveEnableState(pluginId, record.origin, normalizedPlugins);
+    const enableState = resolveEffectiveEnableState({
+      id: pluginId,
+      origin: record.origin,
+      config: normalizedPlugins,
+      rootConfig: config,
+    });
     let enabled = enableState.enabled;
     let reason = enableState.reason;
 

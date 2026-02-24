@@ -30,6 +30,15 @@ function createSymlinkOrSkip(targetPath: string, linkPath: string): boolean {
   }
 }
 
+function createSingleAgentAvatarConfig(workspace: string): OpenClawConfig {
+  return {
+    session: { mainKey: "main" },
+    agents: {
+      list: [{ id: "main", default: true, workspace, identity: { avatar: "avatar-link.png" } }],
+    },
+  } as OpenClawConfig;
+}
+
 describe("gateway session utils", () => {
   test("capArrayByJsonBytes trims from the front", () => {
     const res = capArrayByJsonBytes(["a", "b", "c"], 10);
@@ -243,12 +252,7 @@ describe("gateway session utils", () => {
       return;
     }
 
-    const cfg = {
-      session: { mainKey: "main" },
-      agents: {
-        list: [{ id: "main", default: true, workspace, identity: { avatar: "avatar-link.png" } }],
-      },
-    } as OpenClawConfig;
+    const cfg = createSingleAgentAvatarConfig(workspace);
 
     const result = listAgentsForGateway(cfg);
     expect(result.agents[0]?.identity?.avatarUrl).toBeUndefined();
@@ -265,12 +269,7 @@ describe("gateway session utils", () => {
       return;
     }
 
-    const cfg = {
-      session: { mainKey: "main" },
-      agents: {
-        list: [{ id: "main", default: true, workspace, identity: { avatar: "avatar-link.png" } }],
-      },
-    } as OpenClawConfig;
+    const cfg = createSingleAgentAvatarConfig(workspace);
 
     const result = listAgentsForGateway(cfg);
     expect(result.agents[0]?.identity?.avatarUrl).toBe(
@@ -299,6 +298,28 @@ describe("resolveSessionModelRef", () => {
     });
 
     expect(resolved).toEqual({ provider: "openai-codex", model: "gpt-5.3-codex" });
+  });
+
+  test("preserves openrouter provider when model contains vendor prefix", () => {
+    const cfg = {
+      agents: {
+        defaults: {
+          model: { primary: "openrouter/minimax/minimax-m2.5" },
+        },
+      },
+    } as OpenClawConfig;
+
+    const resolved = resolveSessionModelRef(cfg, {
+      sessionId: "s-or",
+      updatedAt: Date.now(),
+      modelProvider: "openrouter",
+      model: "anthropic/claude-haiku-4.5",
+    });
+
+    expect(resolved).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-haiku-4.5",
+    });
   });
 
   test("falls back to override when runtime model is not recorded yet", () => {

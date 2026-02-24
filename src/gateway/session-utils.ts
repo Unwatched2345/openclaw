@@ -21,6 +21,7 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
+import { openVerifiedFileSync } from "../infra/safe-open-sync.js";
 import {
   normalizeAgentId,
   normalizeMainKey,
@@ -75,10 +76,6 @@ function tryResolveExistingPath(value: string): string | null {
   }
 }
 
-function areSameFileIdentity(preOpen: fs.Stats, opened: fs.Stats): boolean {
-  return preOpen.dev === opened.dev && preOpen.ino === opened.ino;
-}
-
 function resolveIdentityAvatarUrl(
   cfg: OpenClawConfig,
   agentId: string,
@@ -103,37 +100,28 @@ function resolveIdentityAvatarUrl(
   if (!isPathWithinRoot(workspaceRoot, resolvedCandidate)) {
     return undefined;
   }
-  let fd: number | null = null;
   try {
     const resolvedReal = fs.realpathSync(resolvedCandidate);
     if (!isPathWithinRoot(workspaceRoot, resolvedReal)) {
       return undefined;
     }
-    const preOpenStat = fs.lstatSync(resolvedReal);
-    if (!preOpenStat.isFile() || preOpenStat.size > AVATAR_MAX_BYTES) {
+    const opened = openVerifiedFileSync({
+      filePath: resolvedReal,
+      resolvedPath: resolvedReal,
+      maxBytes: AVATAR_MAX_BYTES,
+    });
+    if (!opened.ok) {
       return undefined;
     }
-    const openFlags =
-      fs.constants.O_RDONLY |
-      (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
-    fd = fs.openSync(resolvedReal, openFlags);
-    const openedStat = fs.fstatSync(fd);
-    if (
-      !openedStat.isFile() ||
-      openedStat.size > AVATAR_MAX_BYTES ||
-      !areSameFileIdentity(preOpenStat, openedStat)
-    ) {
-      return undefined;
+    try {
+      const buffer = fs.readFileSync(opened.fd);
+      const mime = resolveAvatarMime(resolvedCandidate);
+      return `data:${mime};base64,${buffer.toString("base64")}`;
+    } finally {
+      fs.closeSync(opened.fd);
     }
-    const buffer = fs.readFileSync(fd);
-    const mime = resolveAvatarMime(resolvedCandidate);
-    return `data:${mime};base64,${buffer.toString("base64")}`;
   } catch {
     return undefined;
-  } finally {
-    if (fd !== null) {
-      fs.closeSync(fd);
-    }
   }
 }
 
@@ -430,7 +418,7 @@ export function resolveSessionStoreKey(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
 }): string {
-  const raw = params.sessionKey.trim();
+  const raw = (params.sessionKey ?? "").trim();
   if (!raw) {
     return raw;
   }
@@ -668,15 +656,20 @@ export function resolveSessionModelRef(
   const runtimeModel = entry?.model?.trim();
   const runtimeProvider = entry?.modelProvider?.trim();
   if (runtimeModel) {
-    const parsedRuntime = parseModelRef(
-      runtimeModel,
-      runtimeProvider || provider || DEFAULT_PROVIDER,
-    );
+    if (runtimeProvider) {
+      // Provider is explicitly recorded — use it directly. Re-parsing the
+      // model string through parseModelRef would incorrectly split OpenRouter
+      // vendor-prefixed model names (e.g. model="anthropic/claude-haiku-4.5"
+      // with provider="openrouter") into { provider: "anthropic" }, discarding
+      // the stored OpenRouter provider and causing direct API calls to a
+      // provider the user has no credentials for.
+      return { provider: runtimeProvider, model: runtimeModel };
+    }
+    const parsedRuntime = parseModelRef(runtimeModel, provider || DEFAULT_PROVIDER);
     if (parsedRuntime) {
       provider = parsedRuntime.provider;
       model = parsedRuntime.model;
     } else {
-      provider = runtimeProvider || provider;
       model = runtimeModel;
     }
     return { provider, model };

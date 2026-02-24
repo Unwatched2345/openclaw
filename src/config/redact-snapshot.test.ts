@@ -46,6 +46,27 @@ function restoreRedactedValues<TOriginal>(
   return result.result as TOriginal;
 }
 
+function expectNestedLevelPairValue(
+  source: Record<string, Record<string, Record<string, unknown>>>,
+  field: string,
+  expected: readonly [unknown, unknown],
+): void {
+  const values = source.nested.level[field] as unknown[];
+  expect(values[0]).toBe(expected[0]);
+  expect(values[1]).toBe(expected[1]);
+}
+
+function expectGatewayAuthFieldValue(
+  result: ReturnType<typeof redactConfigSnapshot>,
+  field: "token" | "password",
+  expected: string,
+): void {
+  const gateway = result.config.gateway as Record<string, Record<string, string>>;
+  const resolved = result.resolved as Record<string, Record<string, Record<string, string>>>;
+  expect(gateway.auth[field]).toBe(expected);
+  expect(resolved.gateway.auth[field]).toBe(expected);
+}
+
 describe("redactConfigSnapshot", () => {
   it("redacts common secret field patterns across config sections", () => {
     const snapshot = makeSnapshot({
@@ -560,12 +581,10 @@ describe("redactConfigSnapshot", () => {
         }),
         assert: ({ redacted, restored }) => {
           const cfg = redacted as Record<string, Record<string, Record<string, unknown>>>;
-          expect((cfg.nested.level.token as unknown[])[0]).toBe(42);
-          expect((cfg.nested.level.token as unknown[])[1]).toBe(815);
+          expectNestedLevelPairValue(cfg, "token", [42, 815]);
 
           const out = restored as Record<string, Record<string, Record<string, unknown>>>;
-          expect((out.nested.level.token as unknown[])[0]).toBe(42);
-          expect((out.nested.level.token as unknown[])[1]).toBe(815);
+          expectNestedLevelPairValue(out, "token", [42, 815]);
         },
       },
       {
@@ -604,12 +623,10 @@ describe("redactConfigSnapshot", () => {
         }),
         assert: ({ redacted, restored }) => {
           const cfg = redacted as Record<string, Record<string, Record<string, unknown>>>;
-          expect((cfg.nested.level.custom as unknown[])[0]).toBe(42);
-          expect((cfg.nested.level.custom as unknown[])[1]).toBe(815);
+          expectNestedLevelPairValue(cfg, "custom", [42, 815]);
 
           const out = restored as Record<string, Record<string, Record<string, unknown>>>;
-          expect((out.nested.level.custom as unknown[])[0]).toBe(42);
-          expect((out.nested.level.custom as unknown[])[1]).toBe(815);
+          expectNestedLevelPairValue(out, "custom", [42, 815]);
         },
       },
     ];
@@ -636,13 +653,10 @@ describe("redactConfigSnapshot", () => {
       gateway: { auth: { token: "not-actually-secret-value" } },
     });
     const result = redactConfigSnapshot(snapshot, hints);
-    const gw = result.config.gateway as Record<string, Record<string, string>>;
-    const resolved = result.resolved as Record<string, Record<string, Record<string, string>>>;
-    expect(gw.auth.token).toBe("not-actually-secret-value");
-    expect(resolved.gateway.auth.token).toBe("not-actually-secret-value");
+    expectGatewayAuthFieldValue(result, "token", "not-actually-secret-value");
   });
 
-  it("does not redact paths absent from uiHints (schema is single source of truth)", () => {
+  it("redacts sensitive-looking paths even when absent from uiHints (defense in depth)", () => {
     const hints: ConfigUiHints = {
       "some.other.path": { sensitive: true },
     };
@@ -650,10 +664,98 @@ describe("redactConfigSnapshot", () => {
       gateway: { auth: { password: "not-in-hints-value" } },
     });
     const result = redactConfigSnapshot(snapshot, hints);
-    const gw = result.config.gateway as Record<string, Record<string, string>>;
-    const resolved = result.resolved as Record<string, Record<string, Record<string, string>>>;
-    expect(gw.auth.password).toBe("not-in-hints-value");
-    expect(resolved.gateway.auth.password).toBe("not-in-hints-value");
+    expectGatewayAuthFieldValue(result, "password", REDACTED_SENTINEL);
+  });
+
+  it("redacts and restores dynamic env catchall secrets when uiHints miss the path", () => {
+    const hints: ConfigUiHints = {
+      "some.other.path": { sensitive: true },
+    };
+    const snapshot = makeSnapshot({
+      env: {
+        GROQ_API_KEY: "gsk-secret-123",
+        NODE_ENV: "production",
+      },
+    });
+    const redacted = redactConfigSnapshot(snapshot, hints);
+    const env = redacted.config.env as Record<string, string>;
+    expect(env.GROQ_API_KEY).toBe(REDACTED_SENTINEL);
+    expect(env.NODE_ENV).toBe("production");
+
+    const restored = restoreRedactedValues(redacted.config, snapshot.config, hints);
+    expect(restored.env.GROQ_API_KEY).toBe("gsk-secret-123");
+    expect(restored.env.NODE_ENV).toBe("production");
+  });
+
+  it("redacts and restores skills entry env secrets in dynamic record paths", () => {
+    const hints: ConfigUiHints = {
+      "some.other.path": { sensitive: true },
+    };
+    const snapshot = makeSnapshot({
+      skills: {
+        entries: {
+          web_search: {
+            env: {
+              GEMINI_API_KEY: "gemini-secret-456",
+              BRAVE_REGION: "us",
+            },
+          },
+        },
+      },
+    });
+    const redacted = redactConfigSnapshot(snapshot, hints);
+    const entry = (
+      redacted.config.skills as {
+        entries: Record<string, { env: Record<string, string> }>;
+      }
+    ).entries.web_search;
+    expect(entry.env.GEMINI_API_KEY).toBe(REDACTED_SENTINEL);
+    expect(entry.env.BRAVE_REGION).toBe("us");
+
+    const restored = restoreRedactedValues(redacted.config, snapshot.config, hints);
+    expect(restored.skills.entries.web_search.env.GEMINI_API_KEY).toBe("gemini-secret-456");
+    expect(restored.skills.entries.web_search.env.BRAVE_REGION).toBe("us");
+  });
+
+  it("contract-covers dynamic catchall/record paths for redact+restore", () => {
+    const hints = mapSensitivePaths(OpenClawSchema, "", {});
+    const snapshot = makeSnapshot({
+      env: {
+        GROQ_API_KEY: "gsk-contract-123",
+        NODE_ENV: "production",
+      },
+      skills: {
+        entries: {
+          web_search: {
+            env: {
+              GEMINI_API_KEY: "gemini-contract-456",
+              BRAVE_REGION: "us",
+            },
+          },
+        },
+      },
+      broadcast: {
+        apiToken: ["broadcast-secret-1", "broadcast-secret-2"],
+        channels: ["ops", "eng"],
+      },
+    });
+
+    const redacted = redactConfigSnapshot(snapshot, hints);
+    const config = redacted.config as {
+      env: Record<string, string>;
+      skills: { entries: Record<string, { env: Record<string, string> }> };
+      broadcast: Record<string, string[]>;
+    };
+
+    expect(config.env.GROQ_API_KEY).toBe(REDACTED_SENTINEL);
+    expect(config.env.NODE_ENV).toBe("production");
+    expect(config.skills.entries.web_search.env.GEMINI_API_KEY).toBe(REDACTED_SENTINEL);
+    expect(config.skills.entries.web_search.env.BRAVE_REGION).toBe("us");
+    expect(config.broadcast.apiToken).toEqual([REDACTED_SENTINEL, REDACTED_SENTINEL]);
+    expect(config.broadcast.channels).toEqual(["ops", "eng"]);
+
+    const restored = restoreRedactedValues(redacted.config, snapshot.config, hints);
+    expect(restored).toEqual(snapshot.config);
   });
 
   it("uses wildcard hints for array items", () => {

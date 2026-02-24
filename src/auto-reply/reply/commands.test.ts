@@ -276,7 +276,7 @@ describe("/approve command", () => {
     } as OpenClawConfig;
     const params = buildParams("/approve abc allow-once", cfg, { SenderId: "123" });
 
-    callGatewayMock.mockResolvedValueOnce({ ok: true });
+    callGatewayMock.mockResolvedValue({ ok: true });
 
     const result = await handleCommands(params);
     expect(result.shouldContinue).toBe(false);
@@ -299,7 +299,7 @@ describe("/approve command", () => {
       GatewayClientScopes: ["operator.write"],
     });
 
-    callGatewayMock.mockResolvedValueOnce({ ok: true });
+    callGatewayMock.mockResolvedValue({ ok: true });
 
     const result = await handleCommands(params);
     expect(result.shouldContinue).toBe(false);
@@ -313,7 +313,7 @@ describe("/approve command", () => {
     } as OpenClawConfig;
     const scopeCases = [["operator.approvals"], ["operator.admin"]];
     for (const scopes of scopeCases) {
-      callGatewayMock.mockResolvedValueOnce({ ok: true });
+      callGatewayMock.mockResolvedValue({ ok: true });
       const params = buildParams("/approve abc allow-once", cfg, {
         Provider: "webchat",
         Surface: "webchat",
@@ -389,6 +389,7 @@ describe("/compact command", () => {
       From: "+15550001",
       To: "+15550002",
     });
+    const agentDir = "/tmp/openclaw-agent-compact";
     vi.mocked(compactEmbeddedPiSession).mockResolvedValueOnce({
       ok: true,
       compacted: false,
@@ -397,6 +398,7 @@ describe("/compact command", () => {
     const result = await handleCompactCommand(
       {
         ...params,
+        agentDir,
         sessionEntry: {
           sessionId: "session-1",
           updatedAt: Date.now(),
@@ -423,6 +425,7 @@ describe("/compact command", () => {
         groupChannel: "#general",
         groupSpace: "workspace-1",
         spawnedBy: "agent:main:parent",
+        agentDir,
       }),
     );
   });
@@ -640,6 +643,22 @@ describe("handleCommands /allowlist", () => {
       entry: "789",
     });
     expect(result.reply?.text).toContain("DM allowlist added");
+  });
+
+  it("rejects blocked account ids and keeps Object.prototype clean", async () => {
+    delete (Object.prototype as Record<string, unknown>).allowFrom;
+
+    const cfg = {
+      commands: { text: true, config: true },
+      channels: { telegram: { allowFrom: ["123"] } },
+    } as OpenClawConfig;
+    const params = buildPolicyParams("/allowlist add dm --account __proto__ 789", cfg);
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Invalid account id");
+    expect((Object.prototype as Record<string, unknown>).allowFrom).toBeUndefined();
+    expect(writeConfigFileMock).not.toHaveBeenCalled();
   });
 
   it("removes DM allowlist entries from canonical allowFrom and deletes legacy dm.allowFrom", async () => {
@@ -907,7 +926,7 @@ describe("handleCommands context", () => {
 describe("handleCommands subagents", () => {
   beforeEach(() => {
     resetSubagentRegistryForTests();
-    callGatewayMock.mockReset();
+    callGatewayMock.mockClear().mockImplementation(async () => ({}));
   });
 
   it("lists subagents when none exist", async () => {

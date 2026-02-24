@@ -10,23 +10,28 @@ const sendMocks = vi.hoisted(() => ({
   reactMessageDiscord: vi.fn(async () => {}),
   removeReactionDiscord: vi.fn(async () => {}),
 }));
-const deliveryMocks = vi.hoisted(() => ({
-  editMessageDiscord: vi.fn(async () => ({})),
-  deliverDiscordReply: vi.fn(async () => {}),
-  createDiscordDraftStream: vi.fn(() => ({
+function createMockDraftStream() {
+  return {
     update: vi.fn<(text: string) => void>(() => {}),
     flush: vi.fn(async () => {}),
     messageId: vi.fn(() => "preview-1"),
     clear: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
     forceNewMessage: vi.fn(() => {}),
-  })),
+  };
+}
+
+const deliveryMocks = vi.hoisted(() => ({
+  editMessageDiscord: vi.fn(async () => ({})),
+  deliverDiscordReply: vi.fn(async () => {}),
+  createDiscordDraftStream: vi.fn(() => createMockDraftStream()),
 }));
 const editMessageDiscord = deliveryMocks.editMessageDiscord;
 const deliverDiscordReply = deliveryMocks.deliverDiscordReply;
 const createDiscordDraftStream = deliveryMocks.createDiscordDraftStream;
 type DispatchInboundParams = {
   dispatcher: {
+    sendBlockReply: (payload: { text?: string }) => boolean | Promise<boolean>;
     sendFinalReply: (payload: { text?: string }) => boolean | Promise<boolean>;
   };
   replyOptions?: {
@@ -71,7 +76,10 @@ vi.mock("../../auto-reply/reply/reply-dispatcher.js", () => ({
     (opts: { deliver: (payload: unknown, info: { kind: string }) => Promise<void> | void }) => ({
       dispatcher: {
         sendToolResult: vi.fn(() => true),
-        sendBlockReply: vi.fn(() => true),
+        sendBlockReply: vi.fn((payload: unknown) => {
+          void opts.deliver(payload as never, { kind: "block" });
+          return true;
+        }),
         sendFinalReply: vi.fn((payload: unknown) => {
           void opts.deliver(payload as never, { kind: "final" });
           return true;
@@ -373,17 +381,6 @@ describe("processDiscordMessage draft streaming", () => {
     await processDiscordMessage(ctx as any);
   }
 
-  function createMockDraftStream() {
-    return {
-      update: vi.fn<(text: string) => void>(() => {}),
-      flush: vi.fn(async () => {}),
-      messageId: vi.fn(() => "preview-1"),
-      clear: vi.fn(async () => {}),
-      stop: vi.fn(async () => {}),
-      forceNewMessage: vi.fn(() => {}),
-    };
-  }
-
   async function createBlockModeContext() {
     return await createBaseContext({
       cfg: {
@@ -424,20 +421,24 @@ describe("processDiscordMessage draft streaming", () => {
   });
 
   it("falls back to standard send when final needs multiple chunks", async () => {
+    await runSingleChunkFinalScenario({ streamMode: "partial", maxLinesPerMessage: 1 });
+
+    expect(editMessageDiscord).not.toHaveBeenCalled();
+    expect(deliverDiscordReply).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses block-kind payload delivery to Discord", async () => {
     dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
-      await params?.dispatcher.sendFinalReply({ text: "Hello\nWorld" });
-      return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };
+      await params?.dispatcher.sendBlockReply({ text: "thinking..." });
+      return { queuedFinal: false, counts: { final: 0, tool: 0, block: 1 } };
     });
 
-    const ctx = await createBaseContext({
-      discordConfig: { streamMode: "partial", maxLinesPerMessage: 1 },
-    });
+    const ctx = await createBaseContext({ discordConfig: { streamMode: "off" } });
 
     // oxlint-disable-next-line typescript/no-explicit-any
     await processDiscordMessage(ctx as any);
 
-    expect(editMessageDiscord).not.toHaveBeenCalled();
-    expect(deliverDiscordReply).toHaveBeenCalledTimes(1);
+    expect(deliverDiscordReply).not.toHaveBeenCalled();
   });
 
   it("streams block previews using draft chunking", async () => {
@@ -474,5 +475,50 @@ describe("processDiscordMessage draft streaming", () => {
     await processDiscordMessage(ctx as any);
 
     expect(draftStream.forceNewMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("strips reasoning tags from partial stream updates", async () => {
+    const draftStream = createMockDraftStream();
+    createDiscordDraftStream.mockReturnValueOnce(draftStream);
+
+    dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
+      await params?.replyOptions?.onPartialReply?.({
+        text: "<thinking>Let me think about this</thinking>\nThe answer is 42",
+      });
+      return { queuedFinal: false, counts: { final: 0, tool: 0, block: 0 } };
+    });
+
+    const ctx = await createBaseContext({
+      discordConfig: { streamMode: "partial" },
+    });
+
+    // oxlint-disable-next-line typescript/no-explicit-any
+    await processDiscordMessage(ctx as any);
+
+    const updates = draftStream.update.mock.calls.map((call) => call[0]);
+    for (const text of updates) {
+      expect(text).not.toContain("<thinking>");
+    }
+  });
+
+  it("skips pure-reasoning partial updates without updating draft", async () => {
+    const draftStream = createMockDraftStream();
+    createDiscordDraftStream.mockReturnValueOnce(draftStream);
+
+    dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
+      await params?.replyOptions?.onPartialReply?.({
+        text: "Reasoning:\nThe user asked about X so I need to consider Y",
+      });
+      return { queuedFinal: false, counts: { final: 0, tool: 0, block: 0 } };
+    });
+
+    const ctx = await createBaseContext({
+      discordConfig: { streamMode: "partial" },
+    });
+
+    // oxlint-disable-next-line typescript/no-explicit-any
+    await processDiscordMessage(ctx as any);
+
+    expect(draftStream.update).not.toHaveBeenCalled();
   });
 });

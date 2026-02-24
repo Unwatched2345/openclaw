@@ -150,6 +150,29 @@ function readLastAgentCommandCall():
     | undefined;
 }
 
+function mockSessionResetSuccess(params: {
+  reason: "new" | "reset";
+  key?: string;
+  sessionId?: string;
+}) {
+  const key = params.key ?? "agent:main:main";
+  const sessionId = params.sessionId ?? "reset-session-id";
+  mocks.sessionsResetHandler.mockImplementation(
+    async (opts: {
+      params: { key: string; reason: string };
+      respond: (ok: boolean, payload?: unknown) => void;
+    }) => {
+      expect(opts.params.key).toBe(key);
+      expect(opts.params.reason).toBe(params.reason);
+      opts.respond(true, {
+        ok: true,
+        key,
+        entry: { sessionId },
+      });
+    },
+  );
+}
+
 async function invokeAgent(
   params: AgentParams,
   options?: {
@@ -255,6 +278,29 @@ describe("gateway agent handler", () => {
     vi.useRealTimers();
   });
 
+  it("respects explicit bestEffortDeliver=false for main session runs", async () => {
+    mocks.agentCommand.mockClear();
+    primeMainAgentRun();
+
+    await invokeAgent(
+      {
+        message: "strict delivery",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        deliver: true,
+        replyChannel: "telegram",
+        to: "123",
+        bestEffortDeliver: false,
+        idempotencyKey: "test-strict-delivery",
+      },
+      { reqId: "strict-1" },
+    );
+
+    await vi.waitFor(() => expect(mocks.agentCommand).toHaveBeenCalled());
+    const callArgs = mocks.agentCommand.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(callArgs.bestEffortDeliver).toBe(false);
+  });
+
   it("handles missing cliSessionIds gracefully", async () => {
     mockMainSessionEntry({});
 
@@ -321,20 +367,7 @@ describe("gateway agent handler", () => {
   });
 
   it("handles bare /new by resetting the same session and sending reset greeting prompt", async () => {
-    mocks.sessionsResetHandler.mockImplementation(
-      async (opts: {
-        params: { key: string; reason: string };
-        respond: (ok: boolean, payload?: unknown) => void;
-      }) => {
-        expect(opts.params.key).toBe("agent:main:main");
-        expect(opts.params.reason).toBe("new");
-        opts.respond(true, {
-          ok: true,
-          key: "agent:main:main",
-          entry: { sessionId: "reset-session-id" },
-        });
-      },
-    );
+    mockSessionResetSuccess({ reason: "new" });
 
     primeMainAgentRun({ sessionId: "reset-session-id" });
 
@@ -366,20 +399,7 @@ describe("gateway agent handler", () => {
         },
       },
     };
-    mocks.sessionsResetHandler.mockImplementation(
-      async (opts: {
-        params: { key: string; reason: string };
-        respond: (ok: boolean, payload?: unknown) => void;
-      }) => {
-        expect(opts.params.key).toBe("agent:main:main");
-        expect(opts.params.reason).toBe("reset");
-        opts.respond(true, {
-          ok: true,
-          key: "agent:main:main",
-          entry: { sessionId: "reset-session-id" },
-        });
-      },
-    );
+    mockSessionResetSuccess({ reason: "reset" });
     mocks.sessionsResetHandler.mockClear();
     primeMainAgentRun({
       sessionId: "reset-session-id",
